@@ -31,10 +31,12 @@ use usbd_midi::{
         //usb_midi::usb_midi_event_packet::UsbMidiEventPacket,
         usb::constants::USB_AUDIO_CLASS,
         usb::constants::USB_MIDISTREAMING_SUBCLASS,
-        midi::notes::Note,
-        midi::message::Message,
+        /*midi::{
+            notes::Note,
+            midi::message::Message,
+            midi::channel::Channel::*
+        },*/
         usb_midi::midi_packet_reader::MidiPacketBufferReader,
-        midi::channel::Channel::*
     },
     midi_device::MidiClass,
 };
@@ -59,8 +61,9 @@ use core::ptr::write_volatile;
 
 use cortex_m_semihosting::hio;
 use core::fmt::Write;
-use cortex_m_semihosting::hprintln;
+//use cortex_m_semihosting::hprintln;
 
+// Print function for debugging
 #[allow(dead_code)]
 pub fn print(value: [u8;4]) -> Result<(), core::fmt::Error> {
     let mut stdout = match hio::hstdout() {
@@ -84,7 +87,6 @@ const APP: () = {
         led: PC13<Output<PushPull>>,
         midi: MidiClass<'static, UsbBusType>,
         usb_dev: UsbDevice<'static, UsbBusType>,
-        //disp: TerminalMode<I2CInterface<BlockingI2c<I2C1, (PB8<Alternate<OpenDrain>>,PB9<Alternate<OpenDrain>>) >>, DisplaySize128x64>,
         display: GraphicsMode<I2CInterface<BlockingI2c<I2C1, (PB8<Alternate<OpenDrain>>,PB9<Alternate<OpenDrain>>) >>, DisplaySize128x64>,
         #[init(Ppq::Ppq24)]
         ppq: Ppq,
@@ -100,19 +102,18 @@ const APP: () = {
     #[init(spawn = [update_display])]
     // CX object contains our PAC. LateResources
     fn init(cx: init::Context) -> init::LateResources{
-        // This is a bit hacky, but gets us the static lifetime for the
-        // allocator. Even when based on hardware initialization..
-        //static mut usb_bus: Option<UsbBusAllocator<UsbBusType>> = None;
-
         // Configure external interrupts (Used for buttons on BP6 and PB7)
         // Enable AFIO clock
         cx.device.RCC.apb2enr.write(|w| w.afioen().enabled());
         // Enable EXTI6 and EXTI7 interrupts
-        cx.device.EXTI.imr.write(|w| unsafe { w.bits(0b00000000000000000000000011000000) });
+        cx.device.EXTI.imr.modify(|_,w| w.mr6().set_bit());
+        cx.device.EXTI.imr.modify(|_,w| w.mr7().set_bit());
         // Set falling trigger
-        cx.device.EXTI.ftsr.write(|w| unsafe { w.bits(0b00000000000000000000000011000000) });
+        cx.device.EXTI.ftsr.modify(|_,w| w.tr6().set_bit());
+        cx.device.EXTI.ftsr.modify(|_,w| w.tr7().set_bit());
         // Set rising trigger
-        cx.device.EXTI.rtsr.write(|w| unsafe { w.bits(0b00000000000000000000000011000000) });
+        cx.device.EXTI.rtsr.modify(|_,w| w.tr6().set_bit());
+        cx.device.EXTI.rtsr.modify(|_,w| w.tr7().set_bit());
 
         // Take ownership of clock register
         let mut rcc = cx.device.RCC.constrain();
