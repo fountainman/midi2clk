@@ -10,6 +10,8 @@ use display::update_display;
 use panic_halt as _; // you can put a breakpoint on `rust_begin_unwind` to catch panics
 //use panic_semihosting as _; // panic handler
 
+use rtic::cyccnt::{Instant, U32Ext};
+
 use stm32f1xx_hal::{
     prelude::*,
     serial,
@@ -21,6 +23,7 @@ use stm32f1xx_hal::{
         {Input, PullUp},
         {Alternate, OpenDrain},
     },
+    timer::{Event, Timer},
     pac::{I2C1, USART1},
     usb::{UsbBus, UsbBusType, Peripheral},
     i2c::{BlockingI2c, DutyCycle, Mode},
@@ -51,8 +54,10 @@ use core::ptr::write_volatile;
 
 use core::fmt::Write;
 
+const TIMEOUT: u32 = 10_000_000;
+
 // Setup the app. We're using the hal Peripheral Access Crate for peripherals
-#[rtic::app(device = stm32f1xx_hal::pac,
+#[rtic::app(device = stm32f1xx_hal::pac, monotonic = rtic::cyccnt::CYCCNT,
 peripherals = true)]
 // RTIC application
 const APP: () = {
@@ -73,10 +78,11 @@ const APP: () = {
         serial: (serial::Tx<USART1>, serial::Rx<USART1>),
         #[init(0)]
         counter: u8,
+        last_tick: Instant,
     }
 
     // Init function (duh)
-    #[init]
+    #[init (schedule = [check_timeout])]
     // CX object contains our PAC. LateResources
     fn init(cx: init::Context) -> init::LateResources{
         // Configure external interrupts (Used for buttons on BP6 and PB7)
@@ -92,6 +98,9 @@ const APP: () = {
         cx.device.EXTI.rtsr.modify(|_,w| w.tr6().set_bit());
         cx.device.EXTI.rtsr.modify(|_,w| w.tr7().set_bit());
 
+        // Enable cycle counter
+        let mut core = cx.core;
+        core.DWT.enable_cycle_counter();
         // Take ownership of clock register
         let mut rcc = cx.device.RCC.constrain();
         // Take ownership of flash peripheral
@@ -116,10 +125,17 @@ const APP: () = {
             .use_hse(8.mhz())
             .sysclk(72.mhz())
             .pclk1(36.mhz())
+            .pclk1(36.mhz())
             .freeze(&mut flash.acr);
 
         // Make sure clocks work with usb
         assert!(clocks.usbclk_valid());
+
+        // -----
+        // Timer
+        // -----
+        let mut timer = Timer::tim2(cx.device.TIM2, &clocks, &mut rcc.apb1);
+        timer.start_count_down(100.hz()).listen(Event::Update);
 
         // Split GPIO ports into smaller pin objects
         let mut gpioc = cx.device.GPIOC.split(&mut rcc.apb2);
@@ -220,6 +236,10 @@ const APP: () = {
             .device_sub_class(USB_MIDISTREAMING_SUBCLASS)
             .build();
 
+        // Schedule timeout checker
+        let last_tick: Instant = cx.start;
+        cx.schedule.check_timeout(cx.start + TIMEOUT.cycles()).unwrap();
+
         // Return late resources to resources object
         init::LateResources {
             led,
@@ -232,6 +252,7 @@ const APP: () = {
             EXTI: cx.device.EXTI,
             clocks,
             serial: (tx, rx),
+            last_tick,
         }
     }
 
@@ -239,6 +260,16 @@ const APP: () = {
     #[idle(resources = [])]
     fn idle(mut _cx: idle::Context) -> ! {
         loop {}
+    }
+
+    #[task (resources = [last_tick], schedule = [check_timeout], spawn = [stop], priority = 1)]
+    fn check_timeout(mut cx: check_timeout::Context){
+        //let mut ticktime : Instant = rtic::CYCCNT::zero();
+        //cx.resources.last_tick.lock(|last_tick| {ticktime = *last_tick});
+        //if ticktime.elapsed() > TIMEOUT.cycles() {
+        //    cx.spawn.stop().unwrap();
+       // }
+        //cx.schedule.check_timeout(Instant::now() + TIMEOUT.cycles()).unwrap();
     }
 
     #[task(binds = EXTI9_5, resources = [&clocks, buttons, EXTI, ppq, display, button_pressed], spawn = [stop], priority = 1)]
@@ -285,8 +316,9 @@ const APP: () = {
         }
     }
 
-    #[task(resources = [beat_clock, counter, ppq, led], priority=2)]
+    #[task(resources = [beat_clock, counter, ppq, led, last_tick], priority=2)]
     fn tick(cx: tick::Context){
+        *cx.resources.last_tick = Instant::now();
         let ppqnum: u8 = cx.resources.ppq.to_u8();
         if ppqnum < 24 {
             let count_max: u8 = cx.resources.ppq.to_max();
@@ -338,15 +370,6 @@ const APP: () = {
                     0xfc => {let _ = cx.spawn.stop();}
                     _ => {}
                 }
-                /*
-                match packet[1] {
-                    0xf8 => {let _ = writeln!(cx.resources.serial.0, "Clock!");}
-                    0xfa => {let _ = writeln!(cx.resources.serial.0, "Start!");}
-                    0xfc => {let _ = writeln!(cx.resources.serial.0, "Stop!");}
-                    _ => {}
-                };
-                let _ = writeln!(cx.resources.serial.0, "Packet_dbg: {:x?}", packet);
-                 */
             }
         }
         return;
@@ -357,6 +380,7 @@ const APP: () = {
         // task scheduling.
         fn DMA1_CHANNEL1();
         fn DMA1_CHANNEL2();
+        fn DMA1_CHANNEL3();
     }
 };
 
