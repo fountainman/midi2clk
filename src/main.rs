@@ -2,7 +2,9 @@
 #![no_main]
 
 mod ppq;
+mod display;
 use ppq::Ppq;
+use display::update_display;
 
 // pick a panicking behavior
 use panic_halt as _; // you can put a breakpoint on `rust_begin_unwind` to catch panics
@@ -10,14 +12,16 @@ use panic_halt as _; // you can put a breakpoint on `rust_begin_unwind` to catch
 
 use stm32f1xx_hal::{
     prelude::*,
+    serial,
     gpio::{
         gpioc::{PC13, PC14},
         gpiob::{PB8, PB9, PB6, PB7},
+        //gpioa::{PA9, PA10},
         {Output, PushPull},
         {Input, PullUp},
         {Alternate, OpenDrain},
     },
-    pac::{I2C1},
+    pac::{I2C1, USART1},
     usb::{UsbBus, UsbBusType, Peripheral},
     i2c::{BlockingI2c, DutyCycle, Mode},
 };
@@ -28,15 +32,8 @@ use usb_device::{
 };
 use usbd_midi::{
     data::{
-        //usb_midi::usb_midi_event_packet::UsbMidiEventPacket,
         usb::constants::USB_AUDIO_CLASS,
         usb::constants::USB_MIDISTREAMING_SUBCLASS,
-        /*midi::{
-            notes::Note,
-            midi::message::Message,
-            midi::channel::Channel::*
-        },*/
-        usb_midi::midi_packet_reader::MidiPacketBufferReader,
     },
     midi_device::MidiClass,
 };
@@ -47,34 +44,12 @@ use ssd1306::{
     Builder,
     I2CDIBuilder,
 };
-use embedded_graphics::{
-    fonts::Text,
-    pixelcolor::BinaryColor,
-    prelude::*,
-    style::TextStyle,
-};
-use profont::ProFont24Point;
 
 // Import peripheral control methods from general HAL definition
 use embedded_hal::digital::v2::{OutputPin, InputPin};
 use core::ptr::write_volatile;
 
-use cortex_m_semihosting::hio;
 use core::fmt::Write;
-//use cortex_m_semihosting::hprintln;
-
-// Print function for debugging
-#[allow(dead_code)]
-pub fn print(value: [u8;4]) -> Result<(), core::fmt::Error> {
-    let mut stdout = match hio::hstdout() {
-        Ok(fd) => fd,
-        Err(()) => return Err(core::fmt::Error),
-    };
-
-    write!(stdout, "Number: {:x}, {:x}, {:x}, {:x}\n", value[0], value[1], value[2], value[3])?;
-
-    Ok(())
-}
 
 // Setup the app. We're using the hal Peripheral Access Crate for peripherals
 #[rtic::app(device = stm32f1xx_hal::pac,
@@ -88,7 +63,6 @@ const APP: () = {
         midi: MidiClass<'static, UsbBusType>,
         usb_dev: UsbDevice<'static, UsbBusType>,
         display: GraphicsMode<I2CInterface<BlockingI2c<I2C1, (PB8<Alternate<OpenDrain>>,PB9<Alternate<OpenDrain>>) >>, DisplaySize128x64>,
-        #[init(Ppq::Ppq24)]
         ppq: Ppq,
         beat_clock: PC14<Output<PushPull>>,
         buttons: (PB7<Input<PullUp>>, PB6<Input<PullUp>>),
@@ -96,10 +70,11 @@ const APP: () = {
         button_pressed: bool,
         EXTI: stm32f1xx_hal::pac::EXTI,
         clocks: stm32f1xx_hal::rcc::Clocks,
+        serial: (serial::Tx<USART1>, serial::Rx<USART1>),
     }
 
     // Init function (duh)
-    #[init(spawn = [update_display])]
+    #[init]
     // CX object contains our PAC. LateResources
     fn init(cx: init::Context) -> init::LateResources{
         // Configure external interrupts (Used for buttons on BP6 and PB7)
@@ -158,6 +133,21 @@ const APP: () = {
         let button_next = gpiob.pb7.into_pull_up_input(&mut gpiob.crl);
         let button_prev = gpiob.pb6.into_pull_up_input(&mut gpiob.crl);
 
+        // -----------
+        // Init serial
+        // -----------
+        let tx1_pin = gpioa.pa9.into_alternate_push_pull(&mut gpioa.crh);
+        let rx1_pin = gpioa.pa10.into_floating_input(&mut gpioa.crh);
+        let cfg = serial::Config::default().baudrate(115_200.bps());
+        let usart1 = serial::Serial::usart1(
+            cx.device.USART1,
+            (tx1_pin, rx1_pin),
+            &mut afio.mapr,
+            cfg,
+            clocks,
+            &mut rcc.apb2,
+        );
+        let (tx, rx) = usart1.split();
 
         // ----------------
         // Init I2C display
@@ -191,8 +181,10 @@ const APP: () = {
         display.init().unwrap();
         display.clear();
 
+        let mut ppq = Ppq::Ppq24;
+
         // Schedule the display to be updated with initial value
-        cx.spawn.update_display().unwrap();
+        update_display(&mut display, &mut ppq);
 
         // ----------
         // USB CONFIG
@@ -232,10 +224,12 @@ const APP: () = {
             usb_dev,
             midi,
             display,
+            ppq,
             buttons: (button_next, button_prev),
             beat_clock,
             EXTI: cx.device.EXTI,
-            clocks
+            clocks,
+            serial: (tx, rx),
         }
     }
 
@@ -245,8 +239,8 @@ const APP: () = {
         loop {}
     }
 
-    #[task(binds = EXTI9_5, spawn = [update_display], resources = [clocks, buttons, EXTI, ppq, button_pressed], priority = 1)]
-    fn handle_buttons(cx: handle_buttons::Context){
+    #[task(binds = EXTI9_5, resources = [&clocks, buttons, EXTI, ppq, display, button_pressed], priority = 1)]
+    fn handle_buttons(mut cx: handle_buttons::Context){
         // Clear interrupt bits
         cx.resources.EXTI.pr.modify(|_, w| w.pr6().set_bit());
         cx.resources.EXTI.pr.modify(|_, w| w.pr7().set_bit());
@@ -258,7 +252,7 @@ const APP: () = {
                 if *cx.resources.button_pressed == false {
                     *cx.resources.button_pressed = true;
                     *cx.resources.ppq = cx.resources.ppq.next();
-                    cx.spawn.update_display().unwrap();
+                    update_display(&mut cx.resources.display, &mut cx.resources.ppq);
                 }
             },
             // Both buttons pressed
@@ -268,7 +262,7 @@ const APP: () = {
                 if *cx.resources.button_pressed == false {
                     *cx.resources.button_pressed = true;
                     *cx.resources.ppq = cx.resources.ppq.prev();
-                    cx.spawn.update_display().unwrap();
+                    update_display(&mut cx.resources.display, &mut cx.resources.ppq);
                 }
             },
             // No buttons pressed (Ready to handle another button press)
@@ -278,21 +272,6 @@ const APP: () = {
                 delay(cx.resources.clocks.sysclk().0 / 40 );
             },
         }
-
-
-    }
-
-    #[task(resources = [display, ppq], priority=1)]
-    fn update_display(cx: update_display::Context){
-
-        cx.resources.display.clear();
-        // Prepare to print PPQ value
-        Text::new(&(cx.resources.ppq.to_str()), Point::new(20,16))
-            .into_styled(TextStyle::new(ProFont24Point, BinaryColor::On))
-            .draw(cx.resources.display)
-            .unwrap();
-
-        cx.resources.display.flush().unwrap();
     }
 
     #[task(binds = USB_HP_CAN_TX, spawn = [handle_usb], priority=3)]
@@ -304,48 +283,29 @@ const APP: () = {
     fn usb_lp_can_rx0(cx: usb_lp_can_rx0::Context){
         cx.spawn.handle_usb().unwrap();
     }
-    #[task(resources = [led, clocks], priority=1)]
-    fn blink_led(mut cx: blink_led::Context) {
-        cx.resources.led.lock(|led| {
-            led.set_low().unwrap();
-        });
-        delay(cx.resources.clocks.sysclk().0 / 80);
-        cx.resources.led.lock(|led| {
-            led.set_high().unwrap();
-        });
-    }
 
-    #[task(resources = [led, midi, usb_dev], spawn = [blink_led], priority=3)]
+    #[task(resources = [led, midi, usb_dev, serial], priority=3)]
     fn handle_usb(cx: handle_usb::Context){
         // Make sure we have data, if not we can leave
         if !cx.resources.usb_dev.poll(&mut [cx.resources.midi]) {
             return;
         }
 
-        let mut buffer = [0; 64];
+        let mut buffer = [0; 32];
         if let Ok(size) = cx.resources.midi.read(&mut buffer) {
-            let buffer_reader = MidiPacketBufferReader::new(&buffer, size);
-            for packet in buffer_reader.into_iter() {
-                if let Ok(packet) = packet {
-                    /*match packet.message {
-                        Message::NoteOn(Channel1, Note::C2, ..) => {
-                            cx.resources.led.set_low().unwrap();
-                        },
-                        Message::NoteOff(Channel1, Note::C2, ..) => {
-                            cx.resources.led.set_high().unwrap();
-                        },
-                        _ => {}
-                    }*/
-                    let bytes: [u8;4] = packet.into();
-                    match bytes[1] {
-                        //0xf8 => {let _ = cx.spawn.blink_led();},
-                        //0xF8 => {cx.spawn.blink_led().unwrap();},
-                        _ => {print(bytes).unwrap();},
-                    }
-                }
+            for packet in buffer.chunks(4){
+                if packet[0] == 0 {break;}
+                /*
+                match packet[1] {
+                    0xf8 => {let _ = writeln!(cx.resources.serial.0, "Clock!");}
+                    0xfa => {let _ = writeln!(cx.resources.serial.0, "Start!");}
+                    0xfc => {let _ = writeln!(cx.resources.serial.0, "Stop!");}
+                    _ => {}
+                };
+                let _ = writeln!(cx.resources.serial.0, "Packet_dbg: {:x?}", packet);
+                 */
             }
         }
-
         return;
     }
     // Required for software tasks
