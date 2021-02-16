@@ -71,6 +71,8 @@ const APP: () = {
         EXTI: stm32f1xx_hal::pac::EXTI,
         clocks: stm32f1xx_hal::rcc::Clocks,
         serial: (serial::Tx<USART1>, serial::Rx<USART1>),
+        #[init(0)]
+        counter: u8,
     }
 
     // Init function (duh)
@@ -181,10 +183,10 @@ const APP: () = {
         display.init().unwrap();
         display.clear();
 
-        let mut ppq = Ppq::Ppq24;
+        let ppq = Ppq::Ppq24;
 
         // Schedule the display to be updated with initial value
-        update_display(&mut display, &mut ppq);
+        update_display(&mut display, ppq.to_str());
 
         // ----------
         // USB CONFIG
@@ -239,20 +241,25 @@ const APP: () = {
         loop {}
     }
 
-    #[task(binds = EXTI9_5, resources = [&clocks, buttons, EXTI, ppq, display, button_pressed], priority = 1)]
+    #[task(binds = EXTI9_5, resources = [&clocks, buttons, EXTI, ppq, display, button_pressed], spawn = [stop], priority = 1)]
     fn handle_buttons(mut cx: handle_buttons::Context){
         // Clear interrupt bits
         cx.resources.EXTI.pr.modify(|_, w| w.pr6().set_bit());
         cx.resources.EXTI.pr.modify(|_, w| w.pr7().set_bit());
 
+        let mut disp_str: &'static str = "";
         // Check button state
         match(cx.resources.buttons.0.is_low().unwrap(), cx.resources.buttons.1.is_low().unwrap()) {
             // "Next" button pressed
             (true, false) => {
                 if *cx.resources.button_pressed == false {
                     *cx.resources.button_pressed = true;
-                    *cx.resources.ppq = cx.resources.ppq.next();
-                    update_display(&mut cx.resources.display, &mut cx.resources.ppq);
+                    cx.resources.ppq.lock(|ppq|{
+                        *ppq = ppq.next();
+                        disp_str = ppq.to_str();
+                    });
+                    let _ = cx.spawn.stop();
+                    update_display(&mut cx.resources.display, disp_str);
                 }
             },
             // Both buttons pressed
@@ -261,8 +268,12 @@ const APP: () = {
             (false, true) => {
                 if *cx.resources.button_pressed == false {
                     *cx.resources.button_pressed = true;
-                    *cx.resources.ppq = cx.resources.ppq.prev();
-                    update_display(&mut cx.resources.display, &mut cx.resources.ppq);
+                    cx.resources.ppq.lock(|ppq|{
+                        *ppq = ppq.prev();
+                        disp_str = ppq.to_str();
+                    });
+                    let _ = cx.spawn.stop();
+                    update_display(&mut cx.resources.display, disp_str);
                 }
             },
             // No buttons pressed (Ready to handle another button press)
@@ -272,6 +283,33 @@ const APP: () = {
                 delay(cx.resources.clocks.sysclk().0 / 40 );
             },
         }
+    }
+
+    #[task(resources = [beat_clock, counter, ppq, led], priority=2)]
+    fn tick(cx: tick::Context){
+        let ppqnum: u8 = cx.resources.ppq.to_u8();
+        if ppqnum < 24 {
+            let count_max: u8 = cx.resources.ppq.to_max();
+            if *cx.resources.counter == 0 {
+                cx.resources.beat_clock.set_high().unwrap();
+                cx.resources.led.set_low().unwrap();
+            } else if *cx.resources.counter == (count_max >> 1){
+                cx.resources.beat_clock.set_low().unwrap();
+                cx.resources.led.set_high().unwrap();
+            }
+            *cx.resources.counter += 1;
+            if *cx.resources.counter >= count_max {*cx.resources.counter = 0;}
+        }else{
+            // Unimplemented: clock multiplication
+            return
+        }
+    }
+
+    #[task(resources = [beat_clock, counter, ppq, led], priority=2)]
+    fn stop(cx: stop::Context){
+        *cx.resources.counter = 0;
+        cx.resources.beat_clock.set_low().unwrap();
+        cx.resources.led.set_high().unwrap();
     }
 
     #[task(binds = USB_HP_CAN_TX, spawn = [handle_usb], priority=3)]
@@ -284,17 +322,22 @@ const APP: () = {
         cx.spawn.handle_usb().unwrap();
     }
 
-    #[task(resources = [led, midi, usb_dev, serial], priority=3)]
+    #[task(resources = [midi, usb_dev], spawn = [tick, stop], priority=3)]
     fn handle_usb(cx: handle_usb::Context){
         // Make sure we have data, if not we can leave
         if !cx.resources.usb_dev.poll(&mut [cx.resources.midi]) {
             return;
         }
-
-        let mut buffer = [0; 32];
-        if let Ok(size) = cx.resources.midi.read(&mut buffer) {
+        let mut buffer = [0; 64];
+        if let Ok(_) = cx.resources.midi.read(&mut buffer) {
             for packet in buffer.chunks(4){
                 if packet[0] == 0 {break;}
+                match packet[1] {
+                    0xf8 => {let _ = cx.spawn.tick();}
+                    0xfa => {let _ = cx.spawn.stop();}
+                    0xfc => {let _ = cx.spawn.stop();}
+                    _ => {}
+                }
                 /*
                 match packet[1] {
                     0xf8 => {let _ = writeln!(cx.resources.serial.0, "Clock!");}

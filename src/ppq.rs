@@ -26,6 +26,16 @@ impl Ppq {
             Ppq::Ppq48 => 48,
         }
     }
+    // This is here to prevent MCU from having to do division in fast sections
+    pub fn to_max(&self) -> u8 {
+        match self {
+            Ppq::Ppq1 => 24,
+            Ppq::Ppq2 => 12,
+            Ppq::Ppq4 => 6,
+            Ppq::Ppq24 => 0,
+            Ppq::Ppq48 => 0,
+        }
+    }
     pub fn next(&self) -> Ppq {
         match self {
             Ppq::Ppq1 => Ppq::Ppq2,

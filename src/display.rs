@@ -1,5 +1,3 @@
-use crate::ppq::Ppq;
-
 use stm32f1xx_hal::{
     gpio::{
         gpiob::{PB8, PB9},
@@ -24,11 +22,11 @@ use profont::ProFont24Point;
 
 pub fn update_display(
     display: &mut GraphicsMode<I2CInterface<BlockingI2c<I2C1, (PB8<Alternate<OpenDrain>>,PB9<Alternate<OpenDrain>>) >>, DisplaySize128x64>,
-    ppq: &mut Ppq,
+    disp_str: &'static str,
 ) {
     display.clear();
     // Prepare to print PPQ value
-    Text::new(&(ppq.to_str()), Point::new(20,16))
+    Text::new(disp_str, Point::new(20,16))
         .into_styled(TextStyle::new(ProFont24Point, BinaryColor::On))
         .draw(display)
         .unwrap();
